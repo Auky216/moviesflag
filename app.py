@@ -1,3 +1,4 @@
+import sqlite3
 from flask import Flask, render_template, request, jsonify
 import requests
 from concurrent.futures import ThreadPoolExecutor
@@ -5,9 +6,16 @@ from concurrent.futures import ThreadPoolExecutor
 app = Flask(__name__)
 apikey = "a0e7d14c"
 
-country_flags_cache = {}
-
 executor = ThreadPoolExecutor(max_workers=10)
+
+# Conexión a la base de datos SQLite
+db_connection = sqlite3.connect("movieflags.db", check_same_thread=False)
+cursor = db_connection.cursor()
+
+# Crear tablas en la base de datos
+with open("schema.sql", "r") as schema_file:
+    cursor.executescript(schema_file.read())
+db_connection.commit()
 
 def searchfilms(search_text, page=1):
     """Función para buscar películas en OMDB."""
@@ -30,30 +38,56 @@ def getmoviedetails(movie_id):
         return None
 
 def get_country_flag(fullname):
-    """Función para obtener la bandera de un país utilizando caché."""
-    if fullname in country_flags_cache:
-        return country_flags_cache[fullname]
-    
+    """Función para obtener la bandera de un país usando la base de datos como caché."""
+    cursor.execute("SELECT flag_url FROM Country WHERE name = ?", (fullname,))
+    result = cursor.fetchone()
+    if result:
+        return result[0]
+
     url = f"https://restcountries.com/v3.1/name/{fullname}?fullText=true"
     response = requests.get(url)
     if response.status_code == 200:
         country_data = response.json()
         if country_data:
             flag_url = country_data[0].get("flags", {}).get("svg", None)
-            country_flags_cache[fullname] = flag_url
+            # Guardar en la base de datos
+            cursor.execute("INSERT OR IGNORE INTO Country (name, flag_url) VALUES (?, ?)", (fullname, flag_url))
+            db_connection.commit()
             return flag_url
     print(f"Failed to retrieve flag for country: {fullname}")
     return None
+
+def store_movie_details(movie, countries):
+    """Guardar detalles de una película en la base de datos."""
+    cursor.execute(
+        "INSERT OR IGNORE INTO Movie (imdbID, title, year) VALUES (?, ?, ?)",
+        (movie["imdbID"], movie["Title"], movie["Year"]),
+    )
+    movie_id = cursor.lastrowid
+
+    for country in countries:
+        cursor.execute("SELECT id FROM Country WHERE name = ?", (country["name"],))
+        country_id = cursor.fetchone()
+        if country_id:
+            country_id = country_id[0]
+        else:
+            cursor.execute("INSERT INTO Country (name, flag_url) VALUES (?, ?)", (country["name"], country["flag"]))
+            country_id = cursor.lastrowid
+
+        cursor.execute(
+            "INSERT OR IGNORE INTO MovieCountry (movie_id, country_id) VALUES (?, ?)",
+            (movie_id, country_id),
+        )
+    db_connection.commit()
 
 def merge_data_with_flags(search_text, page=1):
     """Función para combinar datos de películas con las banderas de sus países."""
     filmssearch = searchfilms(search_text, page)
     if not filmssearch or "Search" not in filmssearch:
         return []
-    
+
     moviesdetailswithflags = []
-    
-    # Obtener detalles de películas en paralelo
+
     futures = {executor.submit(getmoviedetails, movie["imdbID"]): movie for movie in filmssearch["Search"]}
     for future in futures:
         moviedetails = future.result()
@@ -69,6 +103,9 @@ def merge_data_with_flags(search_text, page=1):
                 "countries": countries
             }
             moviesdetailswithflags.append(moviewithflags)
+
+            # Guardar en la base de datos
+            store_movie_details(moviedetails, countries)
 
     return moviesdetailswithflags
 
